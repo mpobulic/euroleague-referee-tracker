@@ -1,0 +1,63 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: referee
+      POSTGRES_PASSWORD: referee
+      POSTGRES_DB: referee_tracker
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U referee"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://referee:referee@db:5432/referee_tracker
+    ports:
+      - "8000:8000"
+    volumes:
+      - video_data:/data/videos
+      - frame_data:/data/frames
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "alembic upgrade head && uvicorn api.main:app --host 0.0.0.0 --port 8000"
+
+  dashboard:
+    build: .
+    env_file: .env
+    environment:
+      API_BASE: http://api:8000/api/v1
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    command: streamlit run dashboard/app.py --server.address 0.0.0.0 --server.port 8501
+
+  ingestion:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://referee:referee@db:5432/referee_tracker
+    volumes:
+      - video_data:/data/videos
+      - frame_data:/data/frames
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m ingestion.scheduler --daemon
+    profiles:
+      - ingestion   # start with: docker-compose --profile ingestion up
+
+volumes:
+  postgres_data:
+  video_data:
+  frame_data:

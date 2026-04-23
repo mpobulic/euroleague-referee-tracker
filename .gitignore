@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data / media (potentially large)
+/data/
+*.mp4
+*.avi
+*.mkv
+
+# YOLO weights (downloaded at runtime)
+*.pt
+*.onnx
+
+# Alembic
+db/migrations/versions/*.py
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
