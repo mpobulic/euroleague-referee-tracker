@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     app_env: str = Field(default="development")
     log_level: str = Field(default="INFO")
     secret_key: str = Field(default="change-me-in-production")
+    cors_allowed_origins: list[str] = Field(
+        default=["http://localhost:8501", "http://localhost:3000"]
+    )
 
     # Workers
     ingestion_workers: int = Field(default=4)

@@ -27,7 +27,7 @@ async def list_incidents(
     limit: int = Query(default=100, le=500),
     offset: int = Query(default=0),
 ):
-    q = select(Incident).options(selectinload(Incident.referee))
+    q = select(Incident).options(selectinload(Incident.referee), selectinload(Incident.game))
 
     if season:
         q = q.join(Game, Incident.game_id == Game.id).join(
@@ -49,14 +49,22 @@ async def list_incidents(
 
     q = q.order_by(Incident.created_at.desc()).limit(limit).offset(offset)
     incidents = (await session.execute(q)).scalars().all()
+    for inc in incidents:
+        inc.round_number = inc.game.round_number if inc.game else None
     return incidents
 
 
 @router.get("/{incident_id}", response_model=IncidentOut)
 async def get_incident(incident_id: int, session: SessionDep):
-    inc = await session.get(Incident, incident_id)
+    q = (
+        select(Incident)
+        .options(selectinload(Incident.referee), selectinload(Incident.game))
+        .where(Incident.id == incident_id)
+    )
+    inc = (await session.execute(q)).scalar_one_or_none()
     if inc is None:
         raise HTTPException(404, detail="Incident not found")
+    inc.round_number = inc.game.round_number if inc.game else None
     return inc
 
 

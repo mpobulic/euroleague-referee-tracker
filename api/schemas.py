@@ -18,6 +18,7 @@ class OKResponse(BaseModel):
 class IncidentOut(BaseModel):
     id: int
     game_id: int
+    round_number: int | None = None
     referee_id: int | None
     incident_type: str
     severity: str

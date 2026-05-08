@@ -2,6 +2,12 @@
 
 AI-powered system to detect, classify, and track referee errors in EuroLeague basketball.
 
+## Current Status
+
+- Implemented: game/referee/play-by-play ingestion, context-based incident classification, incident persistence, API analytics endpoints, Streamlit dashboard.
+- Partially implemented: video download/frame extraction utilities exist, but the production ingestion flow currently runs context-first incident analysis.
+- In progress: vision-assisted incident classification, richer model-assisted validation, and broader production hardening.
+
 ## Architecture
 
 ```
@@ -62,15 +68,15 @@ open http://localhost:8501
 # API docs at http://localhost:8000/docs
 ```
 
-## What It Detects
+## What It Detects (Current)
 
 | Error Type | Detection Method |
 |---|---|
-| Wrong foul call | GPT-4o Vision + game context |
-| Missed foul | Frame analysis + player proximity (YOLOv8) |
-| Missed violation (travel, double dribble) | Play-by-play context + rule engine |
-| Charge vs. block error | Player positions + movement vectors |
-| Out-of-bounds error | Ball trajectory analysis |
+| Wrong foul call | GPT model using play-by-play context |
+| Missed foul | GPT model using play-by-play context |
+| Wrong/missed violation | GPT model using play-by-play context |
+| Charge/block and other call quality errors | GPT model using play-by-play context |
+| Video-assisted evidence extraction | Utility modules present; not default in ingestion pipeline yet |
 
 ## API Endpoints
 
@@ -87,9 +93,22 @@ PATCH /api/v1/incidents/{id}   # human review / override
 
 ## AI Pipeline
 
-**Phase 1 (context-only):** Play-by-play events are parsed, game context is assembled, and GPT-4o classifies calls as correct/incorrect using FIBA rules as the system prompt. No video required.
+**Phase 1 (context-only, active):** Play-by-play events are parsed, game context is assembled, and GPT-4o classifies candidate foul/violation events. Errors are persisted as incidents for analytics/dashboard usage.
 
-**Phase 2 (vision):** Video is downloaded via yt-dlp, key frames are extracted with OpenCV around each foul/violation event, YOLOv8 detects players and ball positions, and GPT-4o Vision analyses the frame + context together.
+**Phase 2 (vision, in progress):** Video can be downloaded via yt-dlp and frames can be extracted with OpenCV. Integrating this path into the default ingestion/classification flow is the next step.
+
+## Testing
+
+```bash
+# Run all tests
+python -m pytest
+
+# Run focused suites
+python -m pytest tests/test_api.py
+python -m pytest tests/test_ingestion_pipeline.py
+```
+
+CI runs on every push and pull request and executes the full pytest suite.
 
 ## Project Structure
 

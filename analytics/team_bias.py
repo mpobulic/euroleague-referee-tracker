@@ -9,7 +9,7 @@ Metrics:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,38 +46,25 @@ async def get_team_bias(
     if team is None:
         return None
 
-    # Build base incident query
-    def _inc_q(team_col: str, home_only: bool | None = None) -> select:
-        q = (
-            select(Incident)
-            .join(Game, Incident.game_id == Game.id)
-            .where(getattr(Incident, team_col) == team_code)
-        )
-        if season_code:
-            q = q.join(Season, Game.season_id == Season.id).where(Season.code == season_code)
-        if home_only is True:
-            q = q.where(Game.home_team_id == team.id)
-        elif home_only is False:
-            q = q.where(Game.away_team_id == team.id)
-        return q
-
-    def _count(rows: list) -> int:
-        return len(rows)
-
-    benefited = _count((await session.execute(_inc_q("team_benefited"))).scalars().all())
-    harmed = _count((await session.execute(_inc_q("team_harmed"))).scalars().all())
-    home_ben = _count((await session.execute(_inc_q("team_benefited", home_only=True))).scalars().all())
-    home_harm = _count((await session.execute(_inc_q("team_harmed", home_only=True))).scalars().all())
-    away_ben = _count((await session.execute(_inc_q("team_benefited", home_only=False))).scalars().all())
-    away_harm = _count((await session.execute(_inc_q("team_harmed", home_only=False))).scalars().all())
+    benefited = await _count_incidents(session, team_code, "team_benefited", season_code=season_code)
+    harmed = await _count_incidents(session, team_code, "team_harmed", season_code=season_code)
+    home_ben = await _count_incidents(
+        session, team_code, "team_benefited", home_only=True, team_id=team.id, season_code=season_code
+    )
+    home_harm = await _count_incidents(
+        session, team_code, "team_harmed", home_only=True, team_id=team.id, season_code=season_code
+    )
+    away_ben = await _count_incidents(
+        session, team_code, "team_benefited", home_only=False, team_id=team.id, season_code=season_code
+    )
+    away_harm = await _count_incidents(
+        session, team_code, "team_harmed", home_only=False, team_id=team.id, season_code=season_code
+    )
 
     # Games played
-    games_q = select(func.count(Game.id)).where(
-        (Game.home_team_id == team.id) | (Game.away_team_id == team.id)
-    )
-    if season_code:
-        games_q = games_q.join(Season, Game.season_id == Season.id).where(Season.code == season_code)
-    games_played = (await session.execute(games_q)).scalar_one() or 1
+    games_played = await _count_games_played(session, team.id, season_code=season_code)
+    if games_played == 0:
+        games_played = 1
 
     net_bias = benefited - harmed
     home_net = home_ben - home_harm
@@ -116,3 +103,38 @@ async def get_all_team_bias(
             reports.append(r)
     reports.sort(key=lambda r: r.net_bias, reverse=True)
     return reports
+
+
+async def _count_incidents(
+    session: AsyncSession,
+    team_code: str,
+    team_col: str,
+    season_code: str | None = None,
+    home_only: bool | None = None,
+    team_id: int | None = None,
+) -> int:
+    q = (
+        select(func.count(Incident.id))
+        .join(Game, Incident.game_id == Game.id)
+        .where(getattr(Incident, team_col) == team_code)
+    )
+    if season_code:
+        q = q.join(Season, Game.season_id == Season.id).where(Season.code == season_code)
+    if home_only is True and team_id is not None:
+        q = q.where(Game.home_team_id == team_id)
+    elif home_only is False and team_id is not None:
+        q = q.where(Game.away_team_id == team_id)
+    return int((await session.execute(q)).scalar_one() or 0)
+
+
+async def _count_games_played(
+    session: AsyncSession,
+    team_id: int,
+    season_code: str | None = None,
+) -> int:
+    q = select(func.count(Game.id)).where(
+        (Game.home_team_id == team_id) | (Game.away_team_id == team_id)
+    )
+    if season_code:
+        q = q.join(Season, Game.season_id == Season.id).where(Season.code == season_code)
+    return int((await session.execute(q)).scalar_one() or 0)

@@ -9,15 +9,44 @@ import logging
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import Game, GameReferee, PlayByPlayEvent, Referee, Season, Team
+from db.models import (
+    ClassificationSource,
+    Game,
+    GameReferee,
+    Incident,
+    IncidentType,
+    PlayByPlayEvent,
+    Referee,
+    Season,
+    Team,
+)
 from ingestion.euroleague_api import EuroleagueClient
 from models.call_classifier import CallClassifier
 from models.context_builder import build_context_for_event
 
 log = structlog.get_logger(__name__)
+
+_CANDIDATE_PLAY_TYPES = {
+    "FV",
+    "FT",
+    "FO",
+    "F",
+    "TFOUL",
+    "PFOUL",
+    "FOUL",
+    "TO",
+    "TREV",
+    "DBLDRIB",
+    "VIO",
+    "VIOLATION",
+    "3SEC",
+    "5SEC",
+    "8SEC",
+    "24SEC",
+}
 
 
 class IngestionPipeline:
@@ -103,7 +132,27 @@ class IngestionPipeline:
             async with semaphore:
                 await self._ingest_single_game(client, season, raw_game, season_code)
 
-        await asyncio.gather(*[_process(g) for g in games_data], return_exceptions=True)
+        results = await asyncio.gather(*[_process(g) for g in games_data], return_exceptions=True)
+        failures: list[tuple[str, Exception]] = []
+        for raw_game, result in zip(games_data, results, strict=False):
+            if isinstance(result, Exception):
+                game_code = str(raw_game.get("code") or raw_game.get("gameCode") or "unknown")
+                failures.append((game_code, result))
+
+        if failures:
+            for game_code, exc in failures:
+                log.error(
+                    "Game ingestion failed",
+                    season=season_code,
+                    game_code=game_code,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+            await self.session.rollback()
+            raise RuntimeError(
+                f"Failed to ingest {len(failures)} of {len(games_data)} games for season {season_code}"
+            )
+
         await self.session.commit()
         log.info("Round ingestion complete", season=season_code, games=len(games_data))
 
@@ -167,6 +216,10 @@ class IngestionPipeline:
             await self._ingest_pbp(game, pbp_events)
             game.pbp_ingested = True
 
+        if not game.analysis_complete:
+            await self._analyze_game_events(game)
+            game.analysis_complete = True
+
         await self.session.flush()
         log.info("Game ingested", game_code=game_code)
 
@@ -190,3 +243,107 @@ class IngestionPipeline:
             self.session.add(ev)
 
         await self.session.flush()
+
+    async def _analyze_game_events(self, game: Game) -> None:
+        events = (
+            await self.session.execute(
+                select(PlayByPlayEvent)
+                .where(PlayByPlayEvent.game_id == game.id)
+                .order_by(PlayByPlayEvent.id)
+            )
+        ).scalars().all()
+
+        if not events:
+            log.info("No play-by-play events available for analysis", game_code=game.game_code)
+            return
+
+        await self.session.execute(
+            delete(Incident).where(
+                Incident.game_id == game.id,
+                Incident.classification_source.in_(
+                    [ClassificationSource.AI_CONTEXT, ClassificationSource.AI_VISION]
+                ),
+            )
+        )
+
+        events_data = [self._pbp_event_to_dict(ev) for ev in events]
+        incident_count = 0
+        for event_data, event in zip(events_data, events, strict=False):
+            if not _is_candidate_event(event_data.get("play_type", "")):
+                continue
+
+            context = build_context_for_event(
+                event_data,
+                events_data,
+                game.home_team.code if game.home_team else "",
+                game.away_team.code if game.away_team else "",
+            )
+            result = await self.classifier.classify(context=context)
+            if not result.is_error:
+                continue
+
+            incident = Incident(
+                game_id=game.id,
+                pbp_event_id=event.id,
+                incident_type=result.incident_type or IncidentType.OTHER,
+                severity=result.severity,
+                classification_source=ClassificationSource.AI_CONTEXT,
+                period=event.period,
+                game_clock=event.game_clock,
+                score_differential=_safe_score_diff(event.home_score, event.away_score),
+                team_benefited=_team_benefited_for_event(
+                    event.team_code, game.home_team.code if game.home_team else None, game.away_team.code if game.away_team else None
+                ),
+                team_harmed=event.team_code,
+                ai_confidence=result.confidence,
+                ai_reasoning=result.reasoning,
+                ai_model=result.model_used,
+                video_timestamp_seconds=event.video_timestamp_seconds,
+                description=result.correct_call_should_be,
+            )
+            self.session.add(incident)
+            incident_count += 1
+
+        await self.session.flush()
+        log.info("Game analysis complete", game_code=game.game_code, incidents_created=incident_count)
+
+    @staticmethod
+    def _pbp_event_to_dict(event: PlayByPlayEvent) -> dict[str, Any]:
+        return {
+            "id": event.id,
+            "period": event.period,
+            "game_clock": event.game_clock,
+            "play_type": event.play_type,
+            "play_info": event.play_info,
+            "player_name": event.player_name,
+            "team_code": event.team_code,
+            "home_score": event.home_score,
+            "away_score": event.away_score,
+            "coordinates_x": event.coordinates_x,
+            "coordinates_y": event.coordinates_y,
+        }
+
+
+def _is_candidate_event(play_type: str) -> bool:
+    normalized = (play_type or "").upper().strip()
+    return normalized in _CANDIDATE_PLAY_TYPES
+
+
+def _team_benefited_for_event(
+    team_code: str | None,
+    home_team_code: str | None,
+    away_team_code: str | None,
+) -> str | None:
+    if not team_code:
+        return None
+    if team_code == home_team_code:
+        return away_team_code
+    if team_code == away_team_code:
+        return home_team_code
+    return None
+
+
+def _safe_score_diff(home_score: int | None, away_score: int | None) -> int | None:
+    if home_score is None or away_score is None:
+        return None
+    return home_score - away_score

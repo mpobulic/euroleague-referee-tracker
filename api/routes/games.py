@@ -3,14 +3,14 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from analytics.game_log import get_game_incident_report
 from api.schemas import GameIncidentReportOut, GameOut
 from db.connection import get_session
-from db.models import Game, Season, Team
+from db.models import Game, Incident, Season, Team
 
 router = APIRouter(prefix="/games", tags=["games"])
 
@@ -25,10 +25,12 @@ async def list_games(
     team: str | None = Query(default=None),
 ):
     q = (
-        select(Game)
+        select(Game, func.count(Incident.id).label("incident_count"))
         .join(Season, Game.season_id == Season.id)
+        .outerjoin(Incident, Incident.game_id == Game.id)
         .options(selectinload(Game.home_team), selectinload(Game.away_team))
         .where(Season.code == season)
+        .group_by(Game.id)
         .order_by(Game.round_number, Game.played_at)
     )
     if round:
@@ -38,22 +40,25 @@ async def list_games(
         if team_row:
             q = q.where((Game.home_team_id == team_row.id) | (Game.away_team_id == team_row.id))
 
-    games = (await session.execute(q)).scalars().all()
-    return [_to_out(g) for g in games]
+    rows = (await session.execute(q)).all()
+    return [_to_out(game, incident_count) for game, incident_count in rows]
 
 
 @router.get("/{game_code}", response_model=GameOut)
 async def get_game(game_code: str, session: SessionDep, season: str = Query(default="E2024")):
     q = (
-        select(Game)
+        select(Game, func.count(Incident.id).label("incident_count"))
         .join(Season, Game.season_id == Season.id)
+        .outerjoin(Incident, Incident.game_id == Game.id)
         .options(selectinload(Game.home_team), selectinload(Game.away_team))
         .where(Game.game_code == game_code, Season.code == season)
+        .group_by(Game.id)
     )
-    game = (await session.execute(q)).scalar_one_or_none()
-    if game is None:
+    row = (await session.execute(q)).one_or_none()
+    if row is None:
         raise HTTPException(404, detail="Game not found")
-    return _to_out(game)
+    game, incident_count = row
+    return _to_out(game, incident_count)
 
 
 @router.get("/{game_code}/incidents", response_model=GameIncidentReportOut)
@@ -66,8 +71,7 @@ async def get_game_incidents(
     return report.__dict__
 
 
-def _to_out(g: Game) -> GameOut:
-    from db.models import Incident
+def _to_out(g: Game, incident_count: int = 0) -> GameOut:
     return GameOut(
         id=g.id,
         game_code=g.game_code,
@@ -79,5 +83,5 @@ def _to_out(g: Game) -> GameOut:
         away_score=g.away_score,
         venue=g.venue,
         analysis_complete=g.analysis_complete,
-        incident_count=len(g.incidents) if g.incidents else 0,
+        incident_count=incident_count,
     )
