@@ -175,3 +175,61 @@ async def test_analyze_game_events_uses_vision_when_frame_available():
     added_incident = session.add.call_args[0][0]
     assert added_incident.classification_source == ClassificationSource.AI_VISION
     assert game.video_downloaded is True
+
+
+@pytest.mark.asyncio
+async def test_analyze_game_events_falls_back_to_context_when_frame_extraction_fails():
+    session = AsyncMock()
+    pipeline = IngestionPipeline(session)
+    pipeline.video_processor = AsyncMock()
+    pipeline.video_processor.download_game_video = AsyncMock(return_value=Path("C:/tmp/game.mp4"))
+    pipeline.classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            is_error=True,
+            incident_type=IncidentType.MISSED_VIOLATION,
+            severity=IncidentSeverity.LOW,
+            confidence=0.6,
+            reasoning="Context-only fallback still detected issue.",
+            correct_call_should_be="travel",
+            model_used="test-model",
+        )
+    )
+
+    event_candidate = SimpleNamespace(
+        id=30,
+        period=2,
+        game_clock="04:50",
+        play_type="TO",
+        play_info="Turnover",
+        player_name="Player Z",
+        team_code="MAD",
+        home_score=42,
+        away_score=40,
+        coordinates_x=None,
+        coordinates_y=None,
+        video_timestamp_seconds=None,
+    )
+
+    class SelectResult:
+        def scalars(self):
+            class ScalarResult:
+                @staticmethod
+                def all():
+                    return [event_candidate]
+
+            return ScalarResult()
+
+    session.execute = AsyncMock(side_effect=[SelectResult(), AsyncMock()])
+    game = SimpleNamespace(
+        id=10,
+        game_code="TEST003",
+        home_team=SimpleNamespace(code="MAD"),
+        away_team=SimpleNamespace(code="BAR"),
+        video_url="https://example.com/vod",
+        video_downloaded=False,
+    )
+
+    await pipeline._analyze_game_events(game)
+
+    added_incident = session.add.call_args[0][0]
+    assert added_incident.classification_source == ClassificationSource.AI_CONTEXT

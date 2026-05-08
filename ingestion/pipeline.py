@@ -325,7 +325,26 @@ class IngestionPipeline:
     async def _prepare_video_for_game(self, game: Game) -> Path | None:
         if not self.video_processor or not game.video_url:
             return None
-        video_path = await self.video_processor.download_game_video(game.game_code, game.video_url)
+        try:
+            video_path = await asyncio.wait_for(
+                self.video_processor.download_game_video(game.game_code, game.video_url),
+                timeout=settings.vision_download_timeout_seconds,
+            )
+        except TimeoutError:
+            log.warning(
+                "Video download timed out; falling back to context-only analysis",
+                game_code=game.game_code,
+                timeout_seconds=settings.vision_download_timeout_seconds,
+            )
+            return None
+        except Exception as exc:
+            log.warning(
+                "Video download failed; falling back to context-only analysis",
+                game_code=game.game_code,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return None
         if video_path is not None:
             game.video_downloaded = True
         return video_path
@@ -339,14 +358,37 @@ class IngestionPipeline:
         if not self.video_processor or video_path is None:
             return None
         timestamp_seconds = game_clock_to_seconds(event.period, event.game_clock)
-        return await asyncio.get_event_loop().run_in_executor(
-            None,
-            self.video_processor.extract_key_frame,
-            video_path,
-            game.game_code,
-            event.id,
-            timestamp_seconds,
-        )
+        for attempt in range(1, settings.vision_frame_extract_retries + 1):
+            try:
+                return await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None,
+                        self.video_processor.extract_key_frame,
+                        video_path,
+                        game.game_code,
+                        event.id,
+                        timestamp_seconds,
+                    ),
+                    timeout=settings.vision_frame_extract_timeout_seconds,
+                )
+            except TimeoutError:
+                log.warning(
+                    "Frame extraction timed out",
+                    game_code=game.game_code,
+                    event_id=event.id,
+                    attempt=attempt,
+                    timeout_seconds=settings.vision_frame_extract_timeout_seconds,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Frame extraction failed",
+                    game_code=game.game_code,
+                    event_id=event.id,
+                    attempt=attempt,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+        return None
 
     @staticmethod
     def _pbp_event_to_dict(event: PlayByPlayEvent) -> dict[str, Any]:

@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     frame_storage_path: str = Field(default="/data/frames")
     ydl_cookies_file: str | None = Field(default=None)
     enable_vision_classification: bool = Field(default=False)
+    vision_download_timeout_seconds: int = Field(default=120)
+    vision_frame_extract_timeout_seconds: int = Field(default=20)
+    vision_frame_extract_retries: int = Field(default=2)
 
     # App
     app_env: str = Field(default="development")
