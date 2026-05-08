@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     video_storage_path: str = Field(default="/data/videos")
     frame_storage_path: str = Field(default="/data/frames")
     ydl_cookies_file: str | None = Field(default=None)
+    enable_vision_classification: bool = Field(default=False)
 
     # App
     app_env: str = Field(default="development")

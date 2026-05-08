@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from db.models import IncidentSeverity, IncidentType
+from db.models import ClassificationSource, IncidentSeverity, IncidentType
 from ingestion.pipeline import (
     IngestionPipeline,
     _is_candidate_event,
@@ -108,4 +109,69 @@ async def test_analyze_game_events_creates_incident_for_error_candidates():
     assert added_incident.team_harmed == "MAD"
     assert added_incident.score_differential == 2
     assert added_incident.ai_model == "test-model"
+    assert added_incident.classification_source == ClassificationSource.AI_CONTEXT
     assert session.flush.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_analyze_game_events_uses_vision_when_frame_available():
+    session = AsyncMock()
+    pipeline = IngestionPipeline(session)
+    pipeline.video_processor = AsyncMock()
+    pipeline.video_processor.download_game_video = AsyncMock(return_value=Path("C:/tmp/game.mp4"))
+    pipeline.video_processor.extract_key_frame = AsyncMock(return_value=Path("C:/tmp/frame.jpg"))
+    pipeline.classifier.classify = AsyncMock(
+        return_value=ClassificationResult(
+            is_error=True,
+            incident_type=IncidentType.MISSED_FOUL,
+            severity=IncidentSeverity.MEDIUM,
+            confidence=0.7,
+            reasoning="Missed foul.",
+            correct_call_should_be="personal_foul",
+            model_used="test-model",
+        )
+    )
+
+    event_candidate = SimpleNamespace(
+        id=20,
+        period=1,
+        game_clock="06:12",
+        play_type="FV",
+        play_info="Foul event",
+        player_name="Player X",
+        team_code="BAR",
+        home_score=30,
+        away_score=31,
+        coordinates_x=None,
+        coordinates_y=None,
+        video_timestamp_seconds=None,
+    )
+
+    class SelectResult:
+        def scalars(self):
+            class ScalarResult:
+                @staticmethod
+                def all():
+                    return [event_candidate]
+
+            return ScalarResult()
+
+    session.execute = AsyncMock(side_effect=[SelectResult(), AsyncMock()])
+    game = SimpleNamespace(
+        id=9,
+        game_code="TEST002",
+        home_team=SimpleNamespace(code="MAD"),
+        away_team=SimpleNamespace(code="BAR"),
+        video_url="https://example.com/vod",
+        video_downloaded=False,
+    )
+
+    async def _fake_extract_frame(*_args, **_kwargs):
+        return Path("C:/tmp/frame.jpg")
+
+    pipeline._extract_frame_for_event = _fake_extract_frame
+    await pipeline._analyze_game_events(game)
+
+    added_incident = session.add.call_args[0][0]
+    assert added_incident.classification_source == ClassificationSource.AI_VISION
+    assert game.video_downloaded is True

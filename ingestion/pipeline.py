@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
 import structlog
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from config import settings
 from db.models import (
     ClassificationSource,
     Game,
@@ -24,6 +26,7 @@ from db.models import (
     Team,
 )
 from ingestion.euroleague_api import EuroleagueClient
+from ingestion.video_processor import VideoProcessor, game_clock_to_seconds
 from models.call_classifier import CallClassifier
 from models.context_builder import build_context_for_event
 
@@ -53,6 +56,7 @@ class IngestionPipeline:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
         self.classifier = CallClassifier()
+        self.video_processor = VideoProcessor() if settings.enable_vision_classification else None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -192,6 +196,12 @@ class IngestionPipeline:
 
         game.home_score = raw.get("homeScore") or raw.get("score", {}).get("home")
         game.away_score = raw.get("awayScore") or raw.get("score", {}).get("away")
+        game.video_url = (
+            raw.get("videoUrl")
+            or raw.get("vodUrl")
+            or raw.get("video_url")
+            or game.video_url
+        )
 
         # Ingest referees
         refs_data = await client.get_game_referees(season_code, game_code)
@@ -267,6 +277,7 @@ class IngestionPipeline:
         )
 
         events_data = [self._pbp_event_to_dict(ev) for ev in events]
+        video_path = await self._prepare_video_for_game(game)
         incident_count = 0
         for event_data, event in zip(events_data, events, strict=False):
             if not _is_candidate_event(event_data.get("play_type", "")):
@@ -278,16 +289,20 @@ class IngestionPipeline:
                 game.home_team.code if game.home_team else "",
                 game.away_team.code if game.away_team else "",
             )
-            result = await self.classifier.classify(context=context)
+            frame_path = await self._extract_frame_for_event(game, event, video_path)
+            result = await self.classifier.classify(context=context, frame_path=frame_path)
             if not result.is_error:
                 continue
 
+            classification_source = (
+                ClassificationSource.AI_VISION if frame_path is not None else ClassificationSource.AI_CONTEXT
+            )
             incident = Incident(
                 game_id=game.id,
                 pbp_event_id=event.id,
                 incident_type=result.incident_type or IncidentType.OTHER,
                 severity=result.severity,
-                classification_source=ClassificationSource.AI_CONTEXT,
+                classification_source=classification_source,
                 period=event.period,
                 game_clock=event.game_clock,
                 score_differential=_safe_score_diff(event.home_score, event.away_score),
@@ -306,6 +321,32 @@ class IngestionPipeline:
 
         await self.session.flush()
         log.info("Game analysis complete", game_code=game.game_code, incidents_created=incident_count)
+
+    async def _prepare_video_for_game(self, game: Game) -> Path | None:
+        if not self.video_processor or not game.video_url:
+            return None
+        video_path = await self.video_processor.download_game_video(game.game_code, game.video_url)
+        if video_path is not None:
+            game.video_downloaded = True
+        return video_path
+
+    async def _extract_frame_for_event(
+        self,
+        game: Game,
+        event: PlayByPlayEvent,
+        video_path: Path | None,
+    ) -> Path | None:
+        if not self.video_processor or video_path is None:
+            return None
+        timestamp_seconds = game_clock_to_seconds(event.period, event.game_clock)
+        return await asyncio.get_event_loop().run_in_executor(
+            None,
+            self.video_processor.extract_key_frame,
+            video_path,
+            game.game_code,
+            event.id,
+            timestamp_seconds,
+        )
 
     @staticmethod
     def _pbp_event_to_dict(event: PlayByPlayEvent) -> dict[str, Any]:
